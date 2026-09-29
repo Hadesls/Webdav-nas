@@ -27,7 +27,7 @@ const { Plugin, PluginSettingTab, Setting, Notice, requestUrl, Modal } = require
 
 const PREFIX = '[WebDAV nas]';
 const PLUGIN_ID = 'webdav-nas';
-const VERSION = '2.6.4';
+const VERSION = '2.6.5';
 
 /* ---------------------------------------------------------------- 工具 */
 function b64(buf) {
@@ -465,8 +465,27 @@ class WebdavFnos extends Plugin {
     } catch (e) { console.error(PREFIX, '保存基线失败', e); }
   }
   async saveAll() {
-    await this.saveData({ settings: this.settings });
-    await this.saveState();
+    // 加固：写盘后回读校验 + 重试，规避 Windows 下杀软/原子改名导致 saveData 静默失败、
+    // 设置改了却没存进磁盘、重启后丢失（表现为 mode/syncConfigDir 被旧值覆盖）。
+    let ok = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await this.saveData({ settings: this.settings });
+        const check = await this.loadData();
+        if (check && check.settings
+            && check.settings.mode === this.settings.mode
+            && !!check.settings.syncConfigDir === !!this.settings.syncConfigDir) {
+          ok = true;
+          break;
+        }
+      } catch (e) { console.error(PREFIX, 'saveAll 写盘异常', e); }
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 400));
+    }
+    if (!ok) {
+      console.error(PREFIX, '⚠️ 设置保存校验未通过（可能被杀软拦截）：请检查 Windows Defender 是否拦截了 data.json 的写入');
+      new Notice(`${PREFIX} 设置未能持久化保存（疑似被杀软拦截），重启可能丢失，请把库文件夹加入 Defender 排除项`, 10000);
+    }
+    try { await this.saveState(); } catch (e) { /* ignore */ }
   }
 
   client() { return new DavClient(this.settings); }
@@ -600,15 +619,18 @@ class WebdavFnos extends Plugin {
 
     if (!wantCfg) {
       for (const f of this.app.vault.getFiles()) {
-        if (isExcludedBy(f.path, pats)) continue;
+        const p = f.path;
+        // 「关闭同步 .obsidian」时必须排除配置/系统目录；否则 getFiles() 会把 .obsidian 下文件（含 data.json）一并纳入同步
+        if (p.startsWith('.obsidian/') || p.startsWith('.git/') || p.startsWith('.trash/')) continue;
+        if (isExcludedBy(p, pats)) continue;
         // 用真实文件系统 stat（adapter.stat），而不是 Obsidian 的缓存 stat ——
         // 否则刚写入/被外部改过的文件可能拿到过时的时间戳，导致判定错乱
         let st = null;
-        try { st = await this.app.vault.adapter.stat(f.path); } catch (e) { /* 落回缓存 */ }
+        try { st = await this.app.vault.adapter.stat(p); } catch (e) { /* 落回缓存 */ }
         if (st && st.type === 'file') {
-          out[f.path] = { size: st.size, mtime: Math.floor(st.mtime / 1000) };
+          out[p] = { size: st.size, mtime: Math.floor(st.mtime / 1000) };
         } else {
-          out[f.path] = { size: f.stat.size, mtime: Math.floor(f.stat.mtime / 1000) };
+          out[p] = { size: f.stat.size, mtime: Math.floor(f.stat.mtime / 1000) };
         }
       }
       return out;
@@ -640,10 +662,16 @@ class WebdavFnos extends Plugin {
       }
     };
     await recurse('/');
+    // adapter.list('/') 通常不返回隐藏的 .obsidian 目录，显式补一次，确保「同步配置目录」打开时真的包含它
+    if (await this.app.vault.adapter.exists('.obsidian')) {
+      await recurse('.obsidian');
+    }
     if (Object.keys(out).length === 0) {
       for (const f of this.app.vault.getFiles()) {
-        if (isExcludedBy(f.path, pats)) continue;
-        out[f.path] = { size: f.stat.size, mtime: Math.floor(f.stat.mtime / 1000) };
+        const p = f.path;
+        if (p.startsWith('.obsidian/') || p.startsWith('.git/') || p.startsWith('.trash/')) continue;
+        if (isExcludedBy(p, pats)) continue;
+        out[p] = { size: f.stat.size, mtime: Math.floor(f.stat.mtime / 1000) };
       }
     }
     return out;
@@ -691,7 +719,14 @@ class WebdavFnos extends Plugin {
           `以免路径重复（群晖常见）`, 9000);
       }
       // 先【静默扫描】：没有任何变化就一声不吭，绝不打扰
+      const wantCfg = !!this.settings.syncConfigDir;
       const remote = await dav.walk();
+      // 「关闭同步 .obsidian」时，远端清单也要排除配置/系统目录，否则下载(pull)仍会把 .obsidian 拉回来
+      if (!wantCfg) {
+        for (const k of Object.keys(remote)) {
+          if (k.startsWith('.obsidian/') || k.startsWith('.git/') || k.startsWith('.trash/')) delete remote[k];
+        }
+      }
       const local = await this.scanLocal();
       const mode = this.settings.mode || 'push';
       // 自动同步（改动触发 / 定时）永远用「只传变动」：只增不覆盖，绝不打扰你正在写的内容
@@ -775,6 +810,11 @@ class WebdavFnos extends Plugin {
       notice.setMessage(`${PREFIX} 更新基线…`);
       const oldFiles = this.state.files || {};
       const remote2 = await dav.walk();
+      if (!wantCfg) {
+        for (const k of Object.keys(remote2)) {
+          if (k.startsWith('.obsidian/') || k.startsWith('.git/') || k.startsWith('.trash/')) delete remote2[k];
+        }
+      }
       const local2 = await this.scanLocal();
       const files = {};
       for (const rel of new Set([...Object.keys(local2), ...Object.keys(remote2)])) {
