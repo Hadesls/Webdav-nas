@@ -176,7 +176,6 @@
 - **飞牛 fnOS** + 内置 WebDAV（`https://域名:5006/WebDAV`）
 - **群晖 DSM** + WebDAV Server 套件（建议英文目录名）
 - 通用 WebDAV（Nginx 反代亦可，注意放行 `PROPFIND / PROPPATCH / MKCOL / COPY / MOVE / LOCK / UNLOCK`）
-
 ---
 
 ## 许可
