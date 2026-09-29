@@ -1,0 +1,11 @@
+# 本地 / 个人文件，切勿提交
+.DS_Store
+data.json
+.sync-state.json
+*.zip
+node_modules/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
