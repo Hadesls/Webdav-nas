@@ -3,7 +3,7 @@
 > 一个轻量的 Obsidian WebDAV 同步插件 —— 桌面（Windows / macOS / Linux）与移动端（iOS / iPadOS / Android）通用。
 
 [![author](https://img.shields.io/badge/author-Hadesr-blue)](#许可)
-[![version](https://img.shields.io/badge/version-2.6.4-green)](#)
+[![version](https://img.shields.io/badge/version-2.6.5-green)](#)
 [![platform](https://img.shields.io/badge/platform-desktop%20%7C%20mobile-lightgrey)](#)
 
 基于 Obsidian 官方 `requestUrl`，**不依赖任何第三方库**。像连你家 NAS 一样直接同步笔记：不经过中转服务器，数据只在你自己的设备与存储之间流动。
