@@ -27,7 +27,7 @@ const { Plugin, PluginSettingTab, Setting, Notice, requestUrl, Modal } = require
 
 const PREFIX = '[WebDAV nas]';
 const PLUGIN_ID = 'webdav-nas';
-const VERSION = '2.6.6';
+const VERSION = '2.6.7';
 
 /* ---------------------------------------------------------------- 工具 */
 function b64(buf) {
@@ -763,7 +763,22 @@ class WebdavFnos extends Plugin {
         new PlanModal(this.app, lines.slice(0, 500), summary).open();
         return;
       }
-      if (risky > 0 && riskyRatio * 100 > (this.settings.protectRatio || 30)) {
+      // 镜像模式：删除是「让两边完全一致」的明确意图，不再被 protectRatio 百分比拦截
+      // —— 否则云端孤儿越多、删除占比越高，越会被拦，陷入「永远清不掉」的死锁。
+      // 但仍兜底：本地 / 云端任一方为空时，禁止反向清空对方，避免误清空整个云 / 本地。
+      const mirror = !!this.settings.mirror;
+      const localEmpty = Object.keys(local).length === 0;
+      const remoteEmpty = Object.keys(remote).length === 0;
+      const mirrorWipe = mirror && (
+        (mode !== 'pull' && localEmpty) ||   // push 镜像 + 本地空 → 会清空云端
+        (mode === 'pull' && remoteEmpty)      // pull 镜像 + 云端空 → 会清空本地
+      );
+      if (mirrorWipe) {
+        new Notice(`${PREFIX} ⛔ 镜像模式：本地 / 云端一方为空，为避免清空对方已中止（请检查同步目录是否正确）`, 12000);
+        console.warn(PREFIX, '镜像模式空一方中止，计划如下：\n' + lines.join('\n'));
+        return;
+      }
+      if (!mirror && risky > 0 && riskyRatio * 100 > (this.settings.protectRatio || 30)) {
         new Notice(`${PREFIX} ⛔ 删除 ${risky} 个（占 ${(riskyRatio * 100).toFixed(0)}%）超过保护阈值，已中止`, 12000);
         console.warn(PREFIX, '已中止，计划如下：\n' + lines.join('\n'));
         return;
@@ -927,7 +942,8 @@ class FnosSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName('镜像模式（服务器 ⇄ 本地 完全一致）')
       .setDesc('⚠️ 开启后：push = 服务器完全等于本地（本地删了/改名的，云端也删/改）；pull = 本地完全等于服务器。' +
         '不再依赖"同步基线"判断是否删除——改名/删文件夹会正确同步，不再出现重复副本。' +
-        '代价：push 时你手动放到云端、本地没有的文件，下次同步会被删（受删除保护阈值兜底）。默认关，保持原保守行为。')
+        '镜像模式下「删除保护阈值」改为仅防止"清空整个云端/本地"（本地或云端任一方为空时中止），不再按百分比拦截，所以云端攒了再多旧副本也能一次清干净。' +
+        '默认关，保持原保守行为。')
       .addToggle((tg) => tg.setValue(!!p.settings.mirror)
         .onChange(async (v) => { p.settings.mirror = v; await p.saveAll(); }));
     new Setting(containerEl).setName('排除规则')
