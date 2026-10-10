@@ -27,7 +27,7 @@ const { Plugin, PluginSettingTab, Setting, Notice, requestUrl, Modal } = require
 
 const PREFIX = '[WebDAV nas]';
 const PLUGIN_ID = 'webdav-nas';
-const VERSION = '2.6.5';
+const VERSION = '2.6.6';
 
 /* ---------------------------------------------------------------- 工具 */
 function b64(buf) {
@@ -281,7 +281,7 @@ class DavClient {
 /* ---------------------------------------------------------------- 同步计划
  * 删除行为完全跟随 mode（不再有单独的删除开关）
  */
-function buildPlan(local, remote, state, mode, granularity) {
+function buildPlan(local, remote, state, mode, granularity, mirror) {
   const acts = [];
   const st = state.files || {};
   const all = new Set([...Object.keys(local), ...Object.keys(remote), ...Object.keys(st)]);
@@ -320,7 +320,8 @@ function buildPlan(local, remote, state, mode, granularity) {
     } else if (L && !R) {
       // 仅本地有
       if (!S) {
-        acts.push(canPush ? ['push', rel, '新文件(仅本地)'] : ['skip', rel, '仅在本地(只下载模式不动)']);
+        if (mirror && mode === 'pull') acts.push(['del_local', rel, '本地独有→删本地(镜像)']);
+        else acts.push(canPush ? ['push', rel, '新文件(仅本地)'] : ['skip', rel, '仅在本地(只下载模式不动)']);
       } else {
         // 基线里存在 → 云端这个文件被删了
         if (mode === 'push') acts.push(['push', rel, '云端缺失→补传']);
@@ -329,7 +330,8 @@ function buildPlan(local, remote, state, mode, granularity) {
     } else if (R && !L) {
       // 仅远端有
       if (!S) {
-        acts.push(canPull ? ['pull', rel, '新文件(仅远端)'] : ['skip', rel, '仅在远端(只上传模式不动)']);
+        if (mirror && mode !== 'pull') acts.push(['del_remote', rel, '云端独有→删云端(镜像)']);
+        else acts.push(canPull ? ['pull', rel, '新文件(仅远端)'] : ['skip', rel, '仅在远端(只上传模式不动)']);
       } else {
         // 基线里存在 → 本地这个文件被删了
         if (mode === 'pull') acts.push(['pull', rel, '本地缺失→补回']);
@@ -381,7 +383,7 @@ class WebdavFnos extends Plugin {
     this.settings = Object.assign({
       address: '', username: '', password: '',
       remoteDir: '', mode: 'push', granularity: 'full',
-      protectRatio: 30, syncConfigDir: false, exclude: '',
+      protectRatio: 30, syncConfigDir: false, mirror: false, exclude: '',
       autoSyncMinutes: 0, autoOnChange: true,
     }, s);
     // 兼容旧字段
@@ -576,7 +578,7 @@ class WebdavFnos extends Plugin {
     try {
       const local = await this.scanLocal();
       const remoteW = await dav.walk();
-      const acts = buildPlan(local, remoteW, this.state, S.mode || 'push', S.granularity || 'full');
+      const acts = buildPlan(local, remoteW, this.state, S.mode || 'push', S.granularity || 'full', !!S.mirror);
       const cnt = {};
       for (const [k] of acts) cnt[k] = (cnt[k] || 0) + 1;
       lines.push(`  方向=${S.mode}  方式=${S.granularity}  基线=${Object.keys(this.state.files || {}).length} 项`);
@@ -734,7 +736,7 @@ class WebdavFnos extends Plugin {
       const granularity = forceFull
         ? 'full'
         : (reason === 'manual' ? (this.settings.granularity || 'full') : 'incremental');
-      const acts = buildPlan(local, remote, this.state, mode, granularity);
+      const acts = buildPlan(local, remote, this.state, mode, granularity, this.settings.mirror);
 
       const cnt = {};
       for (const [k] of acts) cnt[k] = (cnt[k] || 0) + 1;
@@ -922,6 +924,12 @@ class FnosSettingTab extends PluginSettingTab {
         '风险：多设备配置互相覆盖。已强制排除同步基线、workspace、缓存、*.bak。')
       .addToggle((tg) => tg.setValue(!!p.settings.syncConfigDir)
         .onChange(async (v) => { p.settings.syncConfigDir = v; await p.saveAll(); }));
+    new Setting(containerEl).setName('镜像模式（服务器 ⇄ 本地 完全一致）')
+      .setDesc('⚠️ 开启后：push = 服务器完全等于本地（本地删了/改名的，云端也删/改）；pull = 本地完全等于服务器。' +
+        '不再依赖"同步基线"判断是否删除——改名/删文件夹会正确同步，不再出现重复副本。' +
+        '代价：push 时你手动放到云端、本地没有的文件，下次同步会被删（受删除保护阈值兜底）。默认关，保持原保守行为。')
+      .addToggle((tg) => tg.setValue(!!p.settings.mirror)
+        .onChange(async (v) => { p.settings.mirror = v; await p.saveAll(); }));
     new Setting(containerEl).setName('排除规则')
       .setDesc('逗号分隔。可写目录名或路径前缀，例：.trash, 私人, 附件/大文件')
       .addText((t) => t.setValue(p.settings.exclude)
