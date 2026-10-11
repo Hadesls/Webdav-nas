@@ -54,3 +54,13 @@
 @media (max-width: 480px) {
   .wdnas-progress-modal { min-width: auto; }
 }
+
+/* 状态栏同步按钮：同步中旋转 */
+.wdnas-sync-btn.wdnas-spin svg {
+  animation: wdnas-rot 1s linear infinite;
+  transform-origin: 50% 50%;
+}
+@keyframes wdnas-rot {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
