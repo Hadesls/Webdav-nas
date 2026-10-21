@@ -1,7 +1,7 @@
 {
   "id": "webdav-nas",
   "name": "WebDAV nas",
-  "version": "2.6.9",
+  "version": "2.7.0",
   "minAppVersion": "1.0.0",
   "description": "轻量 WebDAV 同步（只上传 / 只下载 / 双向，删除随模式），本地改动自动同步，进度只走右上角通知。桌面与移动端通用.",
   "author": "Hadesr",

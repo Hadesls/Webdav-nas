@@ -1,33 +1,24 @@
 'use strict';
-/*
- * WebDAV nas —— 轻量 WebDAV 同步插件
- * 作者：Hadesr
- * 桌面 + 移动端通用；基于 Obsidian 官方 requestUrl（绕 CORS）
- *
- * v2.2.0 行为约定：
- *   · 同步【方向】：只下载（云端→本地）/ 只上传（本地→云端）/ 双向
- *   · 同步【传送方式】：只传变动（更新，增量）/ 全部对齐（全量，以方向权威侧为准）
- *       只下载 + 全量 = 云端全部覆盖本地（本地乱改一键还原）
- *       只上传 + 全量 = 本地全部刷新到云端
- *       双向   + 全量 = 每个文件取较新
- *   · 删除行为【跟随方向】，没有单独的删除开关：
- *       只下载 → 云端为准：云端删了→删本地；本地缺了→补回
- *       只上传 → 本地为准：本地删了→删云端；云端缺了→补传
- *       双向   → 两侧删除互相传播
- *   · 自动同步（两条独立机制）：
- *       ① 本地文件改动后 ~10 秒自动跑（只下载方向不触发）
- *       ② 可选「定时轮询」每 N 分钟跑一次（默认 0 = 关）
- *   · 【没有变化时完全静默】——不会无端弹"同步中"
- *   · 所有同步进度只走【右上角通知】，绝不弹框打断写作
- *   · 密码以密文（RC4+Base64）存在 data.json 里，可随配置一起同步
- *   · 同步基线单独存 .sync-state.json（不参与同步，各设备独立）
- */
+/* WebDAV nas —— 轻量 WebDAV 同步插件（作者 Hadesr） */
 
 const { Plugin, PluginSettingTab, Setting, Notice, requestUrl, Modal, setIcon } = require('obsidian');
 
 const PREFIX = '[WebDAV nas]';
 const PLUGIN_ID = 'webdav-nas';
-const VERSION = '2.6.9';
+const VERSION = '2.7.0';
+
+/* 路径归一化 + 本插件文件分类 */
+function normRel(p) { return String(p || '').replace(/\\/g, '/').replace(/^\/+/, '').replace(/^\.\//, ''); }
+/* 基线/备份：双向都不同步 */
+function isSelfCfg(rel) {
+  const r = normRel(rel);
+  return r === `.obsidian/plugins/${PLUGIN_ID}/.sync-state.json` ||
+    r.startsWith(`.obsidian/plugins/${PLUGIN_ID}/data.json.bak`);
+}
+/* 本机配置：只上传做云端备份，绝不下载（防止主机的方向覆盖客户端） */
+function isSelfData(rel) {
+  return normRel(rel) === `.obsidian/plugins/${PLUGIN_ID}/data.json`;
+}
 
 /* ---------------------------------------------------------------- 工具 */
 function b64(buf) {
@@ -142,9 +133,7 @@ function isExcludedBy(rel, patterns) {
   }
   return false;
 }
-// 操作系统在各文件夹自动生成的元数据垃圾（绝不是笔记内容）。Mac 的 .DS_Store 会进每个文件夹，
-// 若把它们当"真实文件"，会导致"Mac 上空文件夹"（其实装着 .DS_Store）永远判非空、清不掉、还会被上传到云端。
-// 与 removeEmptyLocalDirs 的 isJunk 对齐：同步时一律忽略这些。
+// 系统元数据垃圾（.DS_Store / Icon\r 等）：一律忽略。
 const OS_JUNK = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini', '.localized', '.apdisk']);
 // Mac 自定义文件夹图标文件：名为 "Icon" + 回车符(0x0D)，无点前缀、isJunk 认不出，但纯系统垃圾。
 OS_JUNK.add('Icon\r');
@@ -156,8 +145,7 @@ class DavClient {
     let rd = String(settings.remoteDir || '').replace(/^\/+|\/+$/g, '');
     this.autoDeduped = false;
     if (rd) {
-      // 地址里已经含有这个目录名时，不再重复拼接。
-      // 群晖很常见：地址本身就是 https://nas:5006/共享文件夹名
+// 地址已含目录名时不再重复拼接（群晖常见）。
       let dec = this.base;
       try { dec = decodeURIComponent(this.base); } catch (e) { /* 保留原样 */ }
       const noScheme = dec.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/]+/, '');
@@ -284,30 +272,30 @@ class DavClient {
   }
 }
 
-/* ---------------------------------------------------------------- 同步计划
- * 删除行为完全跟随 mode（不再有单独的删除开关）
- */
-function buildPlan(local, remote, state, mode, granularity, mirror) {
+/* ---- 同步计划（删除行为跟随同步方向）---- */
+function buildPlan(local, remote, state, mode, granularity, mirror, cfgStrict) {
   const acts = [];
   const st = state.files || {};
-  // 首次同步保护：基线还空(且没开「严格首同步」)时，把"只在一侧的文件"当对方新增→合并，不删；
-  // 建立基线后(或开了镜像)，上传/下载才是严格镜像(多余即删，保证两端一毛一样)。
+// 首同步：基线为空时按合并处理，不删任何一侧。
   const firstSync = Object.keys(st).length === 0 && !mirror;
+  const selfDir = '.obsidian/plugins/' + PLUGIN_ID + '/';
   const all = new Set([...Object.keys(local), ...Object.keys(remote), ...Object.keys(st)]);
   const canPush = (mode !== 'pull');
   const canPull = (mode !== 'push');
   const full = (granularity === 'full');
   const pickNewer = (L, R) => (L.mtime > R.mtime ? 'push' : 'pull');
   for (const rel of [...all].sort()) {
+    if (isSelfCfg(rel)) { acts.push(['skip', rel, '本插件配置→不同步']); continue; }
     const L = local[rel], R = remote[rel], S = st[rel];
+    // 「完全同步 .obsidian」只对配置文件生效：跳过首次同步保护
+    const protectFirst = firstSync && !(cfgStrict && mode === 'pull' && rel.startsWith('.obsidian/'));
     if (L && R) {
       let lCh = false, rCh = false;
       if (S) {
         lCh = L.size !== S.size || Math.abs(L.mtime - (S.mtime || 0)) > 1;
         rCh = R.etag !== S.etag;
       }
-      // 「全量对齐」不依赖基线：直接比较两边实际内容（size）。
-      // 这样即使基线脏了 / 丢了，强制对齐依然 100% 生效。
+// 全量对齐直接比实际内容，不依赖基线。
       const differs = full
         ? (L.size !== R.size)
         : (S ? (lCh || rCh) : (L.size !== R.size));
@@ -330,7 +318,7 @@ function buildPlan(local, remote, state, mode, granularity, mirror) {
       // 仅本地有
       if (!S) {
         // 上传(push)=本地为准→本地独有本就该传上去；下载(pull)=本地以云端为准→本地独有=云端没有→删本地
-        if (mode === 'pull') acts.push([firstSync ? 'skip' : 'del_local', rel, firstSync ? '首次同步→保留本地独有' : '本地独有→删本地(下载=本地以云端为准)']);
+        if (mode === 'pull') acts.push([protectFirst ? 'skip' : 'del_local', rel, protectFirst ? '首次同步→保留本地独有' : '本地独有→删本地(下载=本地以云端为准)']);
         else if (mode === 'sync') acts.push(['push', rel, '双向合并→上传本地独有']);
         else acts.push(canPush ? ['push', rel, '新文件(仅本地)→上传'] : ['skip', rel, '仅在本地(只上传模式不动)']);  // push 上传到云端
       } else {
@@ -344,7 +332,7 @@ function buildPlan(local, remote, state, mode, granularity, mirror) {
         // 下载(pull)=云端为准→云端独有本就该下载；上传(push)=云端以本地为准→云端独有=本地没有→删云端
         if (mode === 'sync') acts.push(['pull', rel, '双向合并→下载云端独有']);
         else if (mode === 'pull') acts.push(canPull ? ['pull', rel, '新文件(仅远端)→下载'] : ['skip', rel, '仅在远端(只下载模式不动)']);
-        else if (mode === 'push') acts.push([firstSync ? 'skip' : 'del_remote', rel, firstSync ? '首次同步→保留云端独有' : '云端独有→删云端(上传=云端以本地为准)']);
+        else if (mode === 'push') acts.push([protectFirst ? 'skip' : 'del_remote', rel, protectFirst ? '首次同步→保留云端独有' : '云端独有→删云端(上传=云端以本地为准)']);
         else acts.push(canPull ? ['pull', rel, '新文件(仅远端)'] : ['skip', rel, '仅在远端(只上传模式不动)']);
       } else {
         // 基线里存在 → 本地这个文件被删了（我删的）→ 双向/上传 跟随删除；下载则重新下载
@@ -353,6 +341,18 @@ function buildPlan(local, remote, state, mode, granularity, mirror) {
       }
     } else {
       acts.push(['forget', rel, '两边都没了']);
+    }
+  }
+  // 本机配置：只上传做云端备份，绝不下载/删除
+  for (const a of acts) {
+    if (isSelfData(a[1]) && (a[0] === 'pull' || a[0] === 'del_local' || a[0] === 'del_remote')) {
+      a[0] = 'skip'; a[2] = '本机配置→只上传不下载';
+    }
+  }
+  // 本插件自身文件永不删除（配置已排除；主程序允许更新，但不许被删）
+  for (const a of acts) {
+    if ((a[0] === 'del_local' || a[0] === 'del_remote') && a[1].startsWith(selfDir)) {
+      a[0] = 'skip'; a[2] = '本插件自身→不删除';
     }
   }
   return acts;
@@ -415,7 +415,7 @@ class WebdavFnos extends Plugin {
     this.settings = Object.assign({
       address: '', username: '', password: '',
       remoteDir: '', mode: 'push', granularity: 'full',
-      protectRatio: 30, syncConfigDir: false, mirror: false, exclude: '',
+      protectRatio: 30, syncConfigDir: false, syncConfigStrict: false, mirror: false, exclude: '',
       autoSyncMinutes: 0, autoOnChange: true, hideOfficialSync: false,
       confirmDelete: true, syncEmptyDirs: false,
     }, s);
@@ -517,11 +517,7 @@ class WebdavFnos extends Plugin {
     }
   }
 
-  // 隐藏官方 Obsidian 核心「同步」图标（右下角状态栏 + 侧边栏按钮）。
-  // 官方图标不是固定 class（不同版本/语言下 class 名会变），所以：
-  //  ① 注入多重 CSS 兜底；② 用 JS 按 aria-label / title / 文本 实时匹配「Sync / 同步」，
-  //     并挂 MutationObserver 兜底官方图标稍后才插入的情况。
-  // ⚠️ 必须排除本插件自己的「⇅ WebDAV」按钮（文本含「WebDAV」，不含 sync / 同步）。
+// 隐藏官方「同步」图标：多重 CSS + MutationObserver 兜底，排除本插件按钮。
   applyOfficialHide() {
     const id = 'wdnas-hide-official';
     const existing = document.getElementById(id);
@@ -579,8 +575,7 @@ class WebdavFnos extends Plugin {
     } catch (e) { console.error(PREFIX, '保存基线失败', e); }
   }
   async saveAll() {
-    // 加固：写盘后回读校验 + 重试，规避 Windows 下杀软/原子改名导致 saveData 静默失败、
-    // 设置改了却没存进磁盘、重启后丢失（表现为 mode/syncConfigDir 被旧值覆盖）。
+// 写盘后回读校验 + 重试，避免 Windows 下 saveData 静默失败。
     let ok = false;
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
@@ -690,7 +685,14 @@ class WebdavFnos extends Plugin {
     try {
       const local = await this.scanLocal();
       const remoteW = await dav.walk();
-      const acts = buildPlan(local, remoteW, this.state, S.mode || 'push', S.granularity || 'full', !!S.mirror);
+      if (!S.syncConfigDir) {
+        for (const k of Object.keys(remoteW)) {
+          if (k.startsWith('.obsidian/') || k.startsWith('.git/') || k.startsWith('.trash/')) delete remoteW[k];
+        }
+      }
+      for (const k of Object.keys(remoteW)) if (isSelfCfg(k)) delete remoteW[k];
+      const cfgStrict = (S.mode === 'pull') && !!S.syncConfigDir && !!S.syncConfigStrict;
+      const acts = buildPlan(local, remoteW, this.state, S.mode || 'push', S.granularity || 'full', !!S.mirror, cfgStrict);
       const cnt = {};
       for (const [k] of acts) cnt[k] = (cnt[k] || 0) + 1;
       lines.push(`  方向=${S.mode}  方式=${S.granularity}  基线=${Object.keys(this.state.files || {}).length} 项`);
@@ -730,12 +732,7 @@ class WebdavFnos extends Plugin {
     const out = {};
     const pats = this.patterns();
     const wantCfg = !!this.settings.syncConfigDir;
-    // 一律走「真实文件系统」枚举（adapter.list），绝不用 Obsidian 的缓存清单 getFiles()。
-    // 关键修复：改名 / 删除【文件夹】时，getFiles() 的缓存会滞后（仍列出旧路径），
-    // 导致旧文件夹文件被当成「本地还在」→ 永不删除云端副本，只新增新文件夹 → 重复。
-    // adapter.list 直接读磁盘，文件夹移动 / 删除后永远拿到真实路径。
-    // ⚠️ 根目录必须用 ''（空串）；Obsidian 的 adapter.list('/') 在部分版本会抛错，
-    // 一旦抛错落到下面的「兜底」就会退回 getFiles 缓存 —— 那正是重复 bug 的根因，所以已彻底删除该兜底。
+// 本地扫描走 adapter.list（真实文件系统），不用 getFiles() 缓存。
     const skipDir = (d) => {
       if (!wantCfg && (d === '.obsidian' || d.startsWith('.obsidian/'))) return true;
       if (d === '.git' || d.startsWith('.git/') || d === '.trash' || d.startsWith('.trash/')) return true;
@@ -751,6 +748,7 @@ class WebdavFnos extends Plugin {
     const skipSuffix = ['.bak', '.bak2', '.bak3', '.tmp'];
     const addFile = (f) => {
       if (!wantCfg && f.startsWith('.obsidian/')) return;
+      if (isSelfCfg(f)) return;
       if (f.startsWith('.git/') || f.startsWith('.trash/')) return;
       if (alwaysSkip.has(f) || alwaysSkip.has(f.split('/').pop())) return;
       if (skipSuffix.some((s) => f.endsWith(s))) return;
@@ -803,8 +801,7 @@ class WebdavFnos extends Plugin {
     return out;
   }
 
-  // 仅镜像模式：收集「远端存在、但本地与远端都没有任何文件」的孤儿目录（改名/删除后残留的空目录壳）。
-  // 这些目录在 buildPlan 的文件级 diff 里看不到（它只比较文件），所以必须单独清理，否则每次改名都多一个空文件夹。
+// 镜像模式：收集远端孤儿空目录。
   async computeOrphanRemoteDirs(dav, local, remote) {
     const remoteFiles = Object.keys(remote || {});
     const localFiles = Object.keys(local || {});
@@ -822,6 +819,7 @@ class WebdavFnos extends Plugin {
     }
     const orphan = [];
     for (const d of remoteDirs) {
+      if (!this.settings.syncConfigDir && (d === '.obsidian' || d.startsWith('.obsidian/'))) continue;
       if (under(d, remoteFiles)) continue;   // 远端还有文件 → 非空
       if (under(d, localFiles)) continue;     // 本地有对应文件 → 需保留（马上要上传）
       orphan.push(d);
@@ -829,12 +827,8 @@ class WebdavFnos extends Plugin {
     return orphan;
   }
 
-  // 仅下载/双向/镜像(下载)模式：收集「本地存在、但本地与云端都没有任何文件」的孤儿目录
-  // （云端删除后残留、或上一轮没清干净的本地空目录壳）。
-  // 与 computeOrphanRemoteDirs 对称：buildPlan 只比文件，空目录壳在文件级 diff 里看不见，必须单独扫。
-  // 关键：必须从文件系统【真实枚举】本地目录树，否则「零文件的空文件夹」不在文件清单里会被漏掉。
-  // 只返回「本地空且云端无对应目录」的目录；真正的物理删除交给 removeEmptyLocalDirs（它会再校验一次）。
-  async computeOrphanLocalDirs(local, remote) {
+// 下载侧：收集本地孤儿空目录。
+  async computeOrphanLocalDirs(local, remote, includeCfg) {
     const localFiles = Object.keys(local || {});
     const remoteFiles = Object.keys(remote || {});
     const base = (this.app.vault.adapter.basePath || '').replace(/\/+$/, '');
@@ -855,10 +849,15 @@ class WebdavFnos extends Plugin {
       for (const fld of (list.folders || [])) {
         const rel = toRel(fld);
         if (!rel || rel === d) continue;
-        if (rel === '.obsidian' || rel.startsWith('.obsidian/') ||
-            rel === '.git' || rel.startsWith('.git/') ||
-            rel === '.trash' || rel.startsWith('.trash/') ||
-            rel.startsWith(`.obsidian/plugins/${PLUGIN_ID}`)) continue;  // 不递归、不删除系统目录
+        if (rel === '.git' || rel.startsWith('.git/') || rel === '.trash' || rel.startsWith('.trash/')) continue;
+        if (rel.startsWith(`.obsidian/plugins/${PLUGIN_ID}`)) continue;   // 本插件自身不删
+        if (rel === '.obsidian' || rel.startsWith('.obsidian/')) {
+          if (!includeCfg) continue;                                       // 默认不动 .obsidian
+          const root = (rel === '.obsidian' || rel === '.obsidian/plugins' || rel === '.obsidian/themes');
+          if (!root) localDirs.add(rel);                                   // 只把具体插件/主题目录当候选
+          if (!seen.has(rel)) stack.push(rel);
+          continue;
+        }
         localDirs.add(rel);
         if (!seen.has(rel)) stack.push(rel);
       }
@@ -892,9 +891,7 @@ class WebdavFnos extends Plugin {
     try { await this.app.vault.adapter.remove(rel); } catch (e) { /* ignore */ }
   }
 
-  // 手动「清空回收站(.trash)」：把库内 .trash 下的文件/文件夹永久删除。
-  // 用途：iOS/安卓的"文件"App 看不到隐藏的 .trash，用户没法手动清 → 用这个命令在 Obsidian 内一键清（插件自身可访问 .trash）。
-  // 注意：这是永久删除、不可恢复，所以先弹确认；且不依赖 rmdir 递归（Mac 也稳）——逐个删文件 + 最深优先删空目录。
+// 清空库内 .trash（永久删除，先确认）。
   async emptyTrash() {
     const ad = this.app.vault.adapter;
     const files = [];
@@ -944,16 +941,15 @@ class WebdavFnos extends Plugin {
     }
   }
 
-  // 下载(删本地)后清理残留的空目录壳：目录里已没有任何「本地/云端」文件就删掉，
-  // 避免「只删文件不删文件夹」留下空壳、反复同步也清不掉的死循环。
-  // 反复扫描：删掉空目录后，其父目录可能也变空 → 继续往上清，最深优先。
-  async removeEmptyLocalDirs(parents, local2, remote2) {
+// 删本地后递归清理空目录壳。
+  async removeEmptyLocalDirs(parents, local2, remote2, includeCfg) {
     const guard = (d) => {
       if (!d) return true;
       if (d === '' || d === '.' || d === '/') return true;
-      if (d === '.obsidian' || d.startsWith('.obsidian/')) return true;
-      if (d === '.git' || d.startsWith('.git/') || d === '.trash' || d.startsWith('.trash/')) return true;
+      if (d === '.obsidian' || d === '.obsidian/plugins' || d === '.obsidian/themes') return true;
       if (d.startsWith(`.obsidian/plugins/${PLUGIN_ID}`)) return true;
+      if (d === '.git' || d.startsWith('.git/') || d === '.trash' || d.startsWith('.trash/')) return true;
+      if (!includeCfg && (d === '.obsidian' || d.startsWith('.obsidian/'))) return true;
       return false;
     };
     const under = (dir, rels) => rels.some((r) => r === dir || r.startsWith(dir + '/'));
@@ -967,15 +963,7 @@ class WebdavFnos extends Plugin {
       `.obsidian/plugins/${PLUGIN_ID}/data.json.bak`,
     ]);
     const skipSuffix = ['.bak', '.bak2', '.bak3', '.tmp'];
-    // 说明：进入本函数的目录，scanLocal 已确认不含"真实同步文件"（.DS_Store/.tmp/排除项等都已被 scanLocal 忽略，
-    // 所以才被 computeOrphanLocalDirs 判为孤儿空壳）。我们直接整目录移入回收站（见 trashDir），不再按规则二次过滤残渣。
-    // 安全删除一个「逻辑为空」的本地目录：整目录「移入回收站」，绝不用 rm -rf 等永久删除。
-    // 进到这里的前提：computeOrphanLocalDirs 已用 scanLocal 规则确认该目录没有任何"真实同步文件"，
-    // 我们只会对确认的空壳动手；且移入回收站 = 可恢复，万一误判也不会丢数据。
-    // 跨平台由 Obsidian 的 adapter 自行处理（桌面走 Node、移动端走 Capacitor），插件里不按 OS 拼 rm/del/rmdir 命令——
-    // 那样既易误删又难维护。trash/trashSystem/trashLocal/rename 在桌面与移动端都存在，且 trash 内部是整目录 rename，
-    // 天然不怕 Mac 的 .DS_Store/Icon\r 残渣（这正是旧逻辑 rmdir 在 Mac 上 ENOTEMPTY「提示删了却没删」的根因）。
-    // 优先级：Vault.trash(系统回收站→失败退回库内 .trash) → adapter.trashSystem(系统回收站) → adapter.trashLocal(库内 .trash) → rename 到 .trash(同名冲突加时间戳)。
+// 逻辑为空的目录：整目录移入回收站（系统回收站优先，退回库内 .trash）。
     const trashDir = async (d) => {
       // 1) 官方 Vault.trash：先尝试系统回收站（Mac ~/.Trash / Windows 回收站），失败自动退回库内 .trash。需抽象文件对象。
       try {
@@ -1014,8 +1002,7 @@ class WebdavFnos extends Plugin {
       for (const d of candidates) {
         if (guard(d)) continue;
         if (under(d, localFiles) || under(d, remoteFiles)) { next.push(d); continue; }
-        // 走到这里说明：scanLocal 视角下该目录已没有任何"真实同步文件"（computeOrphanLocalDirs 已据此确认孤儿）。
-        // 整目录移入回收站（系统回收站优先，退回库内 .trash），可恢复、不怕 Mac 的 .DS_Store/Icon\r 残渣。
+// 确认无真实文件：整目录移入回收站（可恢复）。
         try {
           await trashDir(d);
           removed++;
@@ -1026,8 +1013,7 @@ class WebdavFnos extends Plugin {
           // ENOENT = 目录已不在原位置（上轮已移入回收站 / 被更深子目录顺带移走 / 并发删除）→ 目标达成，不算失败。
           if (e && e.code === 'ENOENT') { /* 已清理，无需告警、不进 failed */ }
           else {
-            // 真正的失败（权限/占用/被锁/系统回收站禁用且库内 .trash 也失败）→ 记日志 + 进 failed 触发 Mac 兜底提醒。
-            // 绝不静默吞、也绝不永久删除（安全第一位）。
+// 失败记日志并进 failed（触发 Mac 兜底提醒）。
             console.warn(PREFIX, '本地空目录移入回收站失败', d, '原因=', (e && e.message) || e);
             if (!failed.includes(d)) failed.push(d);
             next.push(d);
@@ -1066,29 +1052,26 @@ class WebdavFnos extends Plugin {
           if (k.startsWith('.obsidian/') || k.startsWith('.git/') || k.startsWith('.trash/')) delete remote[k];
         }
       }
+      // 本插件自身配置永不参与同步（避免主机的「同步方向」盖掉客户端）
+      for (const k of Object.keys(remote)) if (isSelfCfg(k)) delete remote[k];
       const local = await this.scanLocal();
       const mode = this.settings.mode || 'push';
-      // 自动同步（改动触发 / 定时）永远用「只传变动」：只增不覆盖，绝不打扰你正在写的内容
-      // 手动「立即同步」用设置里的方式（默认「全部对齐」→ 改错了点一下就恢复）
+// 自动同步只用「只传变动」，不覆盖正在写的内容。
       const granularity = forceFull
         ? 'full'
         : (reason === 'manual' ? (this.settings.granularity || 'full') : 'incremental');
-      const acts = buildPlan(local, remote, this.state, mode, granularity, this.settings.mirror);
+      // 「完全同步 .obsidian」只在「只下载」模式生效
+      const cfgStrict = mode === 'pull' && !!this.settings.syncConfigDir && !!this.settings.syncConfigStrict;
+      const acts = buildPlan(local, remote, this.state, mode, granularity, this.settings.mirror, cfgStrict);
 
-      // 镜像模式：预先算出「孤儿空目录」（改名/删除后残留的空目录壳）。
-      // 用于：① 无文件变更时也不提前 return（否则空目录永远清不掉）；② 预览里展示。
-      // 上传(push)/双向(sync)/镜像：清理云端孤儿空目录（让云端目录结构==本地）；下载(pull)不动云端结构
-      // ⚠️ 受「空白文件夹处理」开关控制（默认关=无）：
-      //   关 = 绝不做"主动预扫描清空目录"，避免误删用户新建的/别的设备新建的空白文件夹；
-      //        但「删文件后腾空壳」的安全清理（delLocalParents / delRemoteParents）仍照常，删/改名传播不受影响。
+// 镜像模式：预算孤儿空目录，受「空白文件夹处理」开关控制。
       const wantEmpty = this.settings.syncEmptyDirs === true;   // 默认关
       const orphanDirs = (wantEmpty && mode !== 'pull')
         ? await this.computeOrphanRemoteDirs(dav, local, remote)
         : [];
-      // 下载/双向/镜像(下载)：预先算出「本地孤儿空目录」（云端删除后残留、上一轮没清掉的本地空壳）。
-      // 同样用于：① 无文件变更时也不提前 return；② 收尾一并清理。同样受上面的开关控制。
-      const orphanLocal = (wantEmpty && mode !== 'push')
-        ? await this.computeOrphanLocalDirs(local, remote)
+// 下载侧：预算本地孤儿空目录（同样受开关控制）。
+      const orphanLocal = ((wantEmpty && mode !== 'push') || cfgStrict)
+        ? await this.computeOrphanLocalDirs(local, remote, cfgStrict)
         : [];
 
       const cnt = {};
@@ -1118,9 +1101,7 @@ class WebdavFnos extends Plugin {
         new PlanModal(this.app, preview.slice(0, 500), summary).open();
         return;
       }
-      // ---- 删除前手动确认（默认开）----
-      // 把「删本地文件 / 删云端文件 / 清本地空目录 / 清云端空目录」全部列出来，用户点「确认删除」才执行；
-      // 点「取消」则本次跳过所有删除（上传/下载仍照常）。验证无误后可关「删除前手动确认」恢复全自动。
+// 删除前手动确认：列出所有删除项，确认后才执行。
       const delList = [];
       for (const [k, rel] of acts) {
         if (k === 'del_local') delList.push(`🗑 删本地文件  ${rel}`);
@@ -1146,9 +1127,7 @@ class WebdavFnos extends Plugin {
           if (acts[i][0] === 'del_local' || acts[i][0] === 'del_remote') acts[i] = ['skip', acts[i][1], '用户取消删除'];
         }
       }
-      // 镜像模式：删除是「让两边完全一致」的明确意图，不再被 protectRatio 百分比拦截
-      // —— 否则云端孤儿越多、删除占比越高，越会被拦，陷入「永远清不掉」的死锁。
-      // 但仍兜底：本地 / 云端任一方为空时，禁止反向清空对方，避免误清空整个云 / 本地。
+// 镜像模式不受 protectRatio 拦截，但任一方为空时禁止反向清空。
       const mirror = !!this.settings.mirror;
       const localEmpty = Object.keys(local).length === 0;
       const remoteEmpty = Object.keys(remote).length === 0;
@@ -1210,10 +1189,7 @@ class WebdavFnos extends Plugin {
         this.setSyncBtn(`⟳ ${ok + fail}/${totalActs}`);
       }
 
-      // ---- 重建基线 ----
-      // 关键修复：只把「本次确实对齐过」的文件写进新基线；
-      // 未处理的文件【保留旧基线】。否则会把"本地改错但没同步"的文件记成已同步，
-      // 之后连「强制对齐」都会因判定"两边一致"而跳过（历史 bug）。
+// 重建基线：只写本次确实对齐过的文件，未处理的保留旧基线。
       notice.setMessage(`${PREFIX} 更新基线…`);
       const oldFiles = this.state.files || {};
       const remote2 = await dav.walk();
@@ -1238,9 +1214,7 @@ class WebdavFnos extends Plugin {
       this.state = { files, lastSync: new Date().toISOString() };
       await this.saveState();
 
-      // ---- 清理远端孤儿空目录（改名/删除残留的空目录壳）----
-      // 用「删除文件后的最新远端状态(remote2) + 本地(local)」再算一次，
-      // 既能清掉历史上遗留的空目录，也能在本轮刚删完文件后立刻清掉新产生的空目录。
+// 清理远端孤儿空目录：用最新远端状态再算一次，历史与新产生的都能清掉。
       let cleanedDirs = 0;
       if (orphanDirs.length && !skipDelete) {
         try {
@@ -1253,9 +1227,7 @@ class WebdavFnos extends Plugin {
         } catch (e) { console.warn(PREFIX, '计算孤儿目录失败', e.message); }
       }
 
-      // ---- 清理远端「本次删文件后腾空」的目录壳（对称于本地 delLocalParents）----
-      // 不受「空白文件夹处理」开关影响：这是删/改名传播的必要收敛（只清"本轮删过文件、且现在本地+云端都没文件"的目录），
-      // 不是主动预扫描，绝不会误删用户/别的设备新建的空白文件夹。最深优先，逐层往上。
+// 清理本轮删文件后腾空的远端目录壳（不受开关影响）。
       if (delRemoteParents.length && !skipDelete) {
         const rf2 = Object.keys(remote2 || {});
         const lf2 = Object.keys(local2 || {});
@@ -1271,27 +1243,22 @@ class WebdavFnos extends Plugin {
         }
       }
 
-      // ---- 清理本地孤儿空目录（下载/删本地后残留的空目录壳）----
-      // 与远端同理：本地删文件不删目录，否则「只删文件不删文件夹」会留下一堆空壳，
-      // 反复同步也清不掉，成了死循环。
+// 清理本地孤儿空目录（下载/删本地后残留）。
       let cleanedLocalDirs = 0;
       if (delLocalParents.length && !skipDelete) {
-        try { cleanedLocalDirs += await this.removeEmptyLocalDirs(delLocalParents, local2, remote2); }
+        try { cleanedLocalDirs += await this.removeEmptyLocalDirs(delLocalParents, local2, remote2, cfgStrict); }
         catch (e) { console.warn(PREFIX, '清理本地孤儿目录失败', e.message); }
       }
-      // 即使本轮没删过文件，也清一遍「本地空且云端无对应目录」的残留空壳
-      // （云端删除后、上一轮没清干净的空文件夹会在 buildPlan 文件级 diff 里看不见）。
-      // 下载/双向/镜像(下载)才清（push=本地为准，不应动本地结构）。
+// 即使本轮没删文件，也清一遍本地残留空壳（仅下载/双向/镜像）。
       if (mode !== 'push' && orphanLocal.length && !skipDelete) {
         try {
           orphanLocal.sort((a, b) => b.split('/').length - a.split('/').length);
-          cleanedLocalDirs += await this.removeEmptyLocalDirs(orphanLocal, local2, remote2);
+          cleanedLocalDirs += await this.removeEmptyLocalDirs(orphanLocal, local2, remote2, cfgStrict);
         } catch (e) { console.warn(PREFIX, '清理本地孤儿目录失败', e.message); }
       }
 
       notice.hide();
-      // 目录清理结果做成「可自证」的：清理到就把数量报出来；只有候选却没清掉（被跳过/失败）也报出来，
-      // 避免出现「提示删了、实际没删」这种没法定位的情况。末尾带构建标记，确认跑的是哪份代码。
+// 目录清理结果要可自证：清掉多少、跳过多少都报出来。
       const dirMsg = (cleanedDirs || cleanedLocalDirs)
         ? `，空目录移入回收站 云端${cleanedDirs}/本地${cleanedLocalDirs}`
         : (orphanDirs.length || orphanLocal.length)
@@ -1320,20 +1287,83 @@ class WebdavFnos extends Plugin {
 
 /* ---------------------------------------------------------------- 设置页 */
 class FnosSettingTab extends PluginSettingTab {
-  constructor(app, plugin) { super(app, plugin); this.plugin = plugin; }
+  constructor(app, plugin) { super(app, plugin); this.plugin = plugin; this._page = ''; }
 
+  /* 一级目录 + 二级页：只切 UI，不改设置逻辑 */
   display() {
     const { containerEl } = this;
-    const p = this.plugin;
     containerEl.empty();
-    containerEl.createEl('h2', { text: 'WebDAV nas' });
-    containerEl.createEl('p', {
-      cls: 'setting-item-description',
-      text: `作者：Hadesr　·　版本 v${VERSION}　·　一个轻量的 WebDAV 同步插件（桌面 + 移动端）`,
+    containerEl.addClass('nas-settings');
+    if (!this._page) { this._renderHome(containerEl); return; }
+    this._renderBack(containerEl, this._page);
+    if (this._page === 'conn') this._pageConn(containerEl);
+    else if (this._page === 'sync') this._pageSync(containerEl);
+    else if (this._page === 'auto') this._pageAuto(containerEl);
+    else if (this._page === 'scope') this._pageScope(containerEl);
+    else if (this._page === 'tools') this._pageTools(containerEl);
+    else this._pageAbout(containerEl);
+  }
+
+  _go(page) { this._page = page || ''; this.display(); try { this.containerEl.scrollTop = 0; } catch (e) { /* 忽略 */ } }
+
+  _renderHome(c) {
+    const head = c.createDiv({ cls: 'nas-head' });
+    const logo = head.createDiv({ cls: 'nas-logo' });
+    setIcon(logo, 'cloud');
+    logo.title = '点击立即同步';
+    logo.setAttribute('role', 'button');
+    logo.setAttribute('aria-label', '立即同步');
+    logo.onclick = async () => {
+      if (this.plugin.syncing) return;
+      logo.classList.add('is-syncing');
+      try { await this.plugin.runSync({ dryOnly: false }); }
+      finally { logo.classList.remove('is-syncing'); }
+    };
+    if (this.plugin.syncing) logo.classList.add('is-syncing');
+    head.createDiv({ cls: 'nas-name', text: 'WebDAV nas' });
+    head.createDiv({ cls: 'nas-meta', text: '轻量 WebDAV 同步 · v' + VERSION + ' · 作者 Hadesr' });
+    head.createDiv({ cls: 'nas-hint', text: '点一下云朵立即同步' });
+
+    const s = this.plugin.settings;
+    const dir = { pull: '只下载', push: '只上传', sync: '双向' }[s.mode] || s.mode;
+    const trans = s.granularity === 'full' ? '全部对齐' : '只传变动';
+    const rows = [
+      { id: 'conn', icon: 'plug', name: '连接与账号', desc: (s.address || '未填地址') + ' · ' + (s.username || '未填用户名') },
+      { id: 'sync', icon: 'arrow-left-right', name: '同步方向与方式', desc: dir + ' · ' + trans + ' · 阈值 ' + s.protectRatio + '%' },
+      { id: 'auto', icon: 'timer', name: '自动同步', desc: (s.autoOnChange ? '改动后自动' : '改动不自动') + ' · 轮询 ' + (s.autoSyncMinutes || 0) + ' 分钟' },
+      { id: 'scope', icon: 'shield', name: '同步范围与安全', desc: (s.syncConfigDir ? '含 .obsidian' : '不含 .obsidian') + ' · ' + (s.confirmDelete ? '删前确认' : '自动删') },
+      { id: 'tools', icon: 'wrench', name: '维护与救援', desc: '测试 / 诊断 / 强制对齐 / 重置基线 / 清空回收站' },
+      { id: 'about', icon: 'info', name: '关于', desc: 'v' + VERSION + ' · 作者 Hadesr' },
+    ];
+
+    const self = this;
+    rows.forEach(function (r) {
+      const row = c.createDiv({ cls: 'nas-nav-row' });
+      const ic = row.createDiv({ cls: 'nas-nav-icon' });
+      setIcon(ic, r.icon);
+      const tx = row.createDiv({ cls: 'nas-nav-text' });
+      tx.createEl('div', { cls: 'nas-nav-name', text: r.name });
+      tx.createEl('div', { cls: 'nas-nav-desc', text: r.desc });
+      const ar = row.createDiv({ cls: 'nas-nav-arrow' });
+      setIcon(ar, 'chevron-right');
+      row.onclick = function () { self._go(r.id); };
     });
 
-    containerEl.createEl('h3', { text: '连接' });
-    new Setting(containerEl).setName('服务器地址').setDesc('例：https://hadesr.com:5006/WebDAV')
+    c.createEl('p', { cls: 'setting-item-description nas-foot', text: '同步进度只显示在右上角通知里，不会弹框。' });
+  }
+
+  _renderBack(c, page) {
+    const title = { conn: '连接与账号', sync: '同步方向与方式', auto: '自动同步', scope: '同步范围与安全', tools: '维护与救援', about: '关于' }[page] || '设置';
+    const back = c.createDiv({ cls: 'nas-back' });
+    const ic = back.createSpan({ cls: 'nas-back-icon' });
+    setIcon(ic, 'chevron-left');
+    back.createSpan({ cls: 'nas-back-title', text: title });
+    back.onclick = () => this._go('');
+  }
+
+  _pageConn(containerEl) {
+    const p = this.plugin;
+    new Setting(containerEl).setName('服务器地址').setDesc('例：https://nas.example.com:5006/WebDAV')
       .addText((t) => t.setValue(p.settings.address)
         .onChange(async (v) => { p.settings.address = v.trim(); await p.saveAll(); }));
     new Setting(containerEl).setName('用户名')
@@ -1349,8 +1379,10 @@ class FnosSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName('远端目录').setDesc('留空 = 地址指向的根；填「知识库」则同步到 /WebDAV/知识库/')
       .addText((t) => t.setValue(p.settings.remoteDir)
         .onChange(async (v) => { p.settings.remoteDir = v.trim(); await p.saveAll(); }));
+  }
 
-    containerEl.createEl('h3', { text: '同步方向 + 传送方式' });
+  _pageSync(containerEl) {
+    const p = this.plugin;
     new Setting(containerEl).setName('同步方向')
       .setDesc('只下载 = 云端 → 本地　·　只上传 = 本地 → 云端　·　双向 = 两边互通。' +
         '删除也跟随方向：只下载时云端删了就删本地；只上传时本地删了就删云端；双向则互相传播。')
@@ -1373,8 +1405,10 @@ class FnosSettingTab extends PluginSettingTab {
       .setDesc('一次同步里「删除」占比超过它就中止（只统计删除，上传/下载不受影响）。防误删。')
       .addText((t) => t.setValue(String(p.settings.protectRatio))
         .onChange(async (v) => { p.settings.protectRatio = parseInt(v, 10) || 30; await p.saveAll(); }));
+  }
 
-    containerEl.createEl('h3', { text: '自动同步' });
+  _pageAuto(containerEl) {
+    const p = this.plugin;
     new Setting(containerEl).setName('本地改动后自动同步')
       .setDesc('默认开。本地文件改动约 10 秒后自动跑一次。⚠️【只下载】方向下本地改动' +
         '【完全不会】触发同步（也不会传上去）——要还原被改乱的文件，请手动点「立即同步」。' +
@@ -1390,13 +1424,32 @@ class FnosSettingTab extends PluginSettingTab {
           await p.saveAll();
           p.setupAutoTimer();
         }));
+  }
 
-    containerEl.createEl('h3', { text: '同步范围' });
+  _pageScope(containerEl) {
+    const p = this.plugin;
+    const strictOnDesc = '开启后：云端没有的 .obsidian 文件、插件、主题会从本机删除（进回收站），让本机与云端完全一致。本插件自己的 data.json 永不更新。';
+    const strictOffDesc = '仅在「同步方向 = 只下载」且开启「同步 .obsidian 配置目录」时可用。';
+    const canStrict = () => (p.settings.mode || 'push') === 'pull' && !!p.settings.syncConfigDir;
+
+    let strictSetting = null;
     new Setting(containerEl).setName('同步 .obsidian 配置目录')
       .setDesc('⚠️ 默认关。勾上会同步插件/主题/快捷键等配置（密码已加密，可随配置一起同步）。' +
         '风险：多设备配置互相覆盖。已强制排除同步基线、workspace、缓存、*.bak。')
       .addToggle((tg) => tg.setValue(!!p.settings.syncConfigDir)
-        .onChange(async (v) => { p.settings.syncConfigDir = v; await p.saveAll(); }));
+        .onChange(async (v) => {
+          p.settings.syncConfigDir = v;
+          await p.saveAll();
+          if (strictSetting) {
+            strictSetting.setDisabled(!canStrict());
+            strictSetting.setDesc(canStrict() ? strictOnDesc : strictOffDesc);
+          }
+        }));
+    strictSetting = new Setting(containerEl).setName('完全同步 .obsidian（删除本机多余插件 / 文件夹）')
+      .setDesc(canStrict() ? strictOnDesc : strictOffDesc)
+      .addToggle((tg) => tg.setValue(!!p.settings.syncConfigStrict)
+        .onChange(async (v) => { p.settings.syncConfigStrict = v; await p.saveAll(); }))
+      .setDisabled(!canStrict());
     new Setting(containerEl).setName('严格首同步（关闭首次同步保护）')
       .setDesc('⚠️ 上传/下载本身已是严格镜像（保证两端一毛一样：一边多余就删另一边，含空目录）。' +
         '默认关 = 「首次同步保护」开：第一次同步（基线还空）只合并、不删对端历史文件，避免误清空；建立基线后第二次起就严格相等。' +
@@ -1427,8 +1480,10 @@ class FnosSettingTab extends PluginSettingTab {
       .setDesc('逗号分隔。可写目录名或路径前缀，例：.trash, 私人, 附件/大文件')
       .addText((t) => t.setValue(p.settings.exclude)
         .onChange(async (v) => { p.settings.exclude = v; await p.saveAll(); }));
+  }
 
-    containerEl.createEl('h3', { text: '操作' });
+  _pageTools(containerEl) {
+    const p = this.plugin;
     new Setting(containerEl)
       .addButton((b) => b.setButtonText('测试连接').onClick(() => p.testConn()))
       .addButton((b) => b.setButtonText('诊断').onClick(() => p.diagnose()))
@@ -1454,7 +1509,10 @@ class FnosSettingTab extends PluginSettingTab {
         'iOS/安卓的"文件"App 看不到隐藏的 .trash，用这个按钮在 Obsidian 内清空。' +
         '点后会先弹窗列出内容、你确认才删。')
       .addButton((b) => b.setButtonText('清空回收站').setWarning().onClick(() => p.emptyTrash()));
+  }
 
+  _pageAbout(containerEl) {
+    containerEl.createEl('p', { cls: 'setting-item-description', text: '轻量 WebDAV 同步插件 · 作者 Hadesr · v' + VERSION });
     containerEl.createEl('p', {
       cls: 'setting-item-description',
       text: '同步进度只显示在右上角通知里，不会弹框。' +

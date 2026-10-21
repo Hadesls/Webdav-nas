@@ -64,3 +64,56 @@
   from { transform: rotate(0deg); }
   to   { transform: rotate(360deg); }
 }
+
+/* ---- 设置页：一级目录 + 二级页 ---- */
+.nas-settings .nas-head { text-align: center; padding: 14px 0 18px; }
+.nas-settings .nas-logo {
+  display: flex; justify-content: center; align-items: center;
+  width: 56px; height: 56px; margin: 0 auto;
+  border-radius: 50%; cursor: pointer;
+  transition: background-color .15s ease, transform .1s ease;
+}
+.nas-settings .nas-logo .svg-icon {
+  width: 42px; height: 42px; color: var(--text-accent);
+  transition: color .15s ease;
+}
+.nas-settings .nas-logo:hover { background: var(--background-modifier-hover); }
+.nas-settings .nas-logo:hover .svg-icon {
+  color: var(--text-accent-hover, var(--text-accent));
+  filter: brightness(1.15);
+}
+.nas-settings .nas-logo:active { transform: scale(.94); }
+.nas-settings .nas-logo.is-syncing .svg-icon { animation: nas-spin 1s linear infinite; }
+@keyframes nas-spin { to { transform: rotate(360deg); } }
+.nas-settings .nas-hint { color: var(--text-faint); font-size: .78em; margin-top: 4px; }
+.nas-settings .nas-name { font-size: 1.2em; font-weight: 700; margin-top: 8px; }
+.nas-settings .nas-meta { color: var(--text-muted); font-size: 0.82em; margin-top: 3px; }
+
+.nas-settings .nas-nav-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 10px; border-radius: 8px; cursor: pointer;
+}
+.nas-settings .nas-nav-row:hover { background: var(--background-modifier-hover); }
+.nas-settings .nas-nav-icon { display: flex; align-items: center; color: var(--text-accent); }
+.nas-settings .nas-nav-text { flex: 1; min-width: 0; }
+.nas-settings .nas-nav-name { font-weight: 600; }
+.nas-settings .nas-nav-desc {
+  color: var(--text-muted); font-size: 0.82em; margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.nas-settings .nas-nav-arrow { display: flex; color: var(--text-faint); }
+
+.nas-settings .nas-back {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 0 10px; cursor: pointer; color: var(--text-muted);
+}
+.nas-settings .nas-back:hover { color: var(--text-normal); }
+.nas-settings .nas-back-icon { display: flex; }
+.nas-settings .nas-back-title { font-weight: 600; color: var(--text-normal); }
+.nas-settings .nas-foot { margin-top: 18px; }
+
+/* 移动端：加大点击区 */
+@media (max-width: 600px) {
+  .nas-settings .nas-nav-row { padding: 14px 8px; }
+  .nas-settings .nas-nav-desc { white-space: normal; }
+}
