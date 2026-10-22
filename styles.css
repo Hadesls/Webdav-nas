@@ -65,28 +65,66 @@
   to   { transform: rotate(360deg); }
 }
 
+/* 云朵悬停 / 同步中：色相流动（彩色）；只改颜色，不加灰底 */
+@keyframes wdnas-hue {
+  from { filter: hue-rotate(0deg) saturate(1.35); }
+  to   { filter: hue-rotate(360deg) saturate(1.35); }
+}
+.wdnas-ribbon:hover,
+.wdnas-ribbon.wdnas-spin,
+.wdnas-sync-btn:hover,
+.wdnas-sync-btn.wdnas-spin,
+.nas-settings .nas-logo:hover,
+.nas-settings .nas-logo.is-syncing {
+  animation: wdnas-hue 2.4s linear infinite;
+}
+.wdnas-ribbon.wdnas-spin .svg-icon {
+  animation: wdnas-rot 1s linear infinite;
+  transform-origin: 50% 50%;
+}
+
+/* 左侧栏云朵 / 状态栏云朵：悬停只变色，不要灰底圆圈 */
+.side-dock-ribbon-action.wdnas-ribbon,
+.status-bar-item.wdnas-sync-btn {
+  background: transparent !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  transition: color .15s ease;
+}
+.side-dock-ribbon-action.wdnas-ribbon:hover,
+.status-bar-item.wdnas-sync-btn:hover {
+  background: transparent !important;
+  color: var(--text-accent);
+}
+.side-dock-ribbon-action.wdnas-ribbon:hover .svg-icon,
+.status-bar-item.wdnas-sync-btn:hover .svg-icon {
+  color: var(--text-accent);
+}
+
 /* ---- 设置页：一级目录 + 二级页 ---- */
 .nas-settings .nas-head { text-align: center; padding: 14px 0 18px; }
 .nas-settings .nas-logo {
   display: flex; justify-content: center; align-items: center;
   width: 56px; height: 56px; margin: 0 auto;
-  border-radius: 50%; cursor: pointer;
-  transition: background-color .15s ease, transform .1s ease;
+  cursor: pointer;
+  transition: transform .1s ease;
 }
 .nas-settings .nas-logo .svg-icon {
   width: 42px; height: 42px; color: var(--text-accent);
   transition: color .15s ease;
 }
-.nas-settings .nas-logo:hover { background: var(--background-modifier-hover); }
+.nas-settings .nas-logo:hover { background: transparent; }
 .nas-settings .nas-logo:hover .svg-icon {
   color: var(--text-accent-hover, var(--text-accent));
-  filter: brightness(1.15);
 }
 .nas-settings .nas-logo:active { transform: scale(.94); }
 .nas-settings .nas-logo.is-syncing .svg-icon { animation: nas-spin 1s linear infinite; }
 @keyframes nas-spin { to { transform: rotate(360deg); } }
-.nas-settings .nas-hint { color: var(--text-faint); font-size: .78em; margin-top: 4px; }
-.nas-settings .nas-name { font-size: 1.2em; font-weight: 700; margin-top: 8px; }
+.nas-settings .nas-name {
+  font-size: 1.2em; font-weight: 700; margin-top: 8px;
+  cursor: pointer; transition: color .15s ease;
+}
+.nas-settings .nas-name:hover { color: var(--color-orange, #e8842c); }
 .nas-settings .nas-meta { color: var(--text-muted); font-size: 0.82em; margin-top: 3px; }
 
 .nas-settings .nas-nav-row {
@@ -110,7 +148,6 @@
 .nas-settings .nas-back:hover { color: var(--text-normal); }
 .nas-settings .nas-back-icon { display: flex; }
 .nas-settings .nas-back-title { font-weight: 600; color: var(--text-normal); }
-.nas-settings .nas-foot { margin-top: 18px; }
 
 /* 移动端：加大点击区 */
 @media (max-width: 600px) {

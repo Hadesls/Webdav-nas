@@ -5,7 +5,7 @@ const { Plugin, PluginSettingTab, Setting, Notice, requestUrl, Modal, setIcon } 
 
 const PREFIX = '[WebDAV nas]';
 const PLUGIN_ID = 'webdav-nas';
-const VERSION = '2.7.0';
+const VERSION = '2.7.1';
 
 /* 路径归一化 + 本插件文件分类 */
 function normRel(p) { return String(p || '').replace(/\\/g, '/').replace(/^\/+/, '').replace(/^\.\//, ''); }
@@ -452,13 +452,16 @@ class WebdavFnos extends Plugin {
     this.autoTimer = null;
     this.autoDebounce = null;
 
-    this.addRibbonIcon('refresh-cw', 'WebDAV 同步', () => this.runSync({ dryOnly: false }));
+    const ribbonIcon = this.addRibbonIcon('cloud', '', () => this.runSync({ dryOnly: false }));
+    ribbonIcon.addClass('wdnas-ribbon');
+    ribbonIcon.setAttribute('aria-label', '立即同步');
+    this.ribbonIcon = ribbonIcon;
 
     // 状态栏（右下角）同步按钮：纯【云朵】图标（与官方环形同步图标区分开），点击立即同步；同步中变旋转图标
     this.syncBtn = this.addStatusBarItem();
     this.syncBtn.addClass('wdnas-sync-btn');
     setIcon(this.syncBtn, 'cloud');
-    this.syncBtn.setAttribute('title', 'WebDAV nas：点击立即同步（设置里可隐藏官方同步图标）');
+    this.syncBtn.setAttribute('title', '立即同步');
     this.syncBtn.addEventListener('click', () => this.runSync({ dryOnly: false }));
     // 应用「隐藏官方同步图标」开关
     this.applyOfficialHide();
@@ -505,11 +508,12 @@ class WebdavFnos extends Plugin {
 
   // 状态栏按钮：纯图标。idle = cloud（云朵，与官方环形同步图标区分）；同步中 = loader（旋转），进度放 tooltip（不显示文字）
   setSyncBtn(state) {
+    if (this.ribbonIcon) this.ribbonIcon.classList.toggle('wdnas-spin', state !== 'idle');
     if (!this.syncBtn) return;
     if (state === 'idle') {
       setIcon(this.syncBtn, 'cloud');
       this.syncBtn.classList.remove('wdnas-spin');
-      this.syncBtn.setAttribute('title', 'WebDAV nas：点击立即同步（设置里可隐藏官方同步图标）');
+      this.syncBtn.setAttribute('title', '立即同步');
     } else {
       setIcon(this.syncBtn, 'loader');
       this.syncBtn.classList.add('wdnas-spin');
@@ -1320,9 +1324,12 @@ class FnosSettingTab extends PluginSettingTab {
       finally { logo.classList.remove('is-syncing'); }
     };
     if (this.plugin.syncing) logo.classList.add('is-syncing');
-    head.createDiv({ cls: 'nas-name', text: 'WebDAV nas' });
+    const nameEl = head.createDiv({ cls: 'nas-name', text: 'WebDAV nas' });
+    nameEl.title = '关于';
+    nameEl.setAttribute('role', 'button');
+    nameEl.setAttribute('aria-label', '关于');
+    nameEl.onclick = () => this._go('about');
     head.createDiv({ cls: 'nas-meta', text: '轻量 WebDAV 同步 · v' + VERSION + ' · 作者 Hadesr' });
-    head.createDiv({ cls: 'nas-hint', text: '点一下云朵立即同步' });
 
     const s = this.plugin.settings;
     const dir = { pull: '只下载', push: '只上传', sync: '双向' }[s.mode] || s.mode;
@@ -1332,8 +1339,7 @@ class FnosSettingTab extends PluginSettingTab {
       { id: 'sync', icon: 'arrow-left-right', name: '同步方向与方式', desc: dir + ' · ' + trans + ' · 阈值 ' + s.protectRatio + '%' },
       { id: 'auto', icon: 'timer', name: '自动同步', desc: (s.autoOnChange ? '改动后自动' : '改动不自动') + ' · 轮询 ' + (s.autoSyncMinutes || 0) + ' 分钟' },
       { id: 'scope', icon: 'shield', name: '同步范围与安全', desc: (s.syncConfigDir ? '含 .obsidian' : '不含 .obsidian') + ' · ' + (s.confirmDelete ? '删前确认' : '自动删') },
-      { id: 'tools', icon: 'wrench', name: '维护与救援', desc: '测试 / 诊断 / 强制对齐 / 重置基线 / 清空回收站' },
-      { id: 'about', icon: 'info', name: '关于', desc: 'v' + VERSION + ' · 作者 Hadesr' },
+      { id: 'tools', icon: 'wrench', name: '维护与救援', desc: '测试 / 诊断 / 强制对齐 / 重置基线 / 清空回收站' }
     ];
 
     const self = this;
@@ -1349,7 +1355,6 @@ class FnosSettingTab extends PluginSettingTab {
       row.onclick = function () { self._go(r.id); };
     });
 
-    c.createEl('p', { cls: 'setting-item-description nas-foot', text: '同步进度只显示在右上角通知里，不会弹框。' });
   }
 
   _renderBack(c, page) {
@@ -1515,7 +1520,7 @@ class FnosSettingTab extends PluginSettingTab {
     containerEl.createEl('p', { cls: 'setting-item-description', text: '轻量 WebDAV 同步插件 · 作者 Hadesr · v' + VERSION });
     containerEl.createEl('p', {
       cls: 'setting-item-description',
-      text: '同步进度只显示在右上角通知里，不会弹框。' +
+      text: '同步进度在通知里显示，不会弹框。' +
         '显示「同步完成」时文件已全部传完；飞牛文件管理器若没马上看到，刷新一下即可（NAS 端索引延迟）。',
     });
   }
